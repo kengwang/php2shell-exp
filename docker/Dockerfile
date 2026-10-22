@@ -3,15 +3,15 @@
 #   docker build -t p2s-php844:latest .                       # ubuntu:24.04 + USTC apt mirror
 #   docker build -t p2s-php844:latest --build-arg APT_MIRROR=mirrors.ustc.edu.cn .
 #   docker build -t p2s-php844:latest \
-#          --build-arg BASE=php844apache-full:latest \
-#          --build-arg APT=skip .                             # offline: reuse the lab base image
+#          --build-arg BASE=<image-that-already-has-the-php-build-deps> \
+#          --build-arg APT=skip .                             # offline: reuse a warm base image
 #
 # The exploit chains are calibrated against bin/libphp.so byte-for-byte
-# (zif_system = 0x457fe0, zval_ptr_dtor = 0x64b890), so the PHP binary is
-# shipped prebuilt instead of being recompiled; recompiling shifts offsets.
-# bin/libphp.so was extracted from the lab build (php-src 8.4.4,
-# src/php-src-844.tar) with:
-#   docker cp php844full_def:/usr/src/php/libs/libphp.so docker/bin/libphp.so
+# (zif_system = 0x457fe0, zval_ptr_dtor = 0x64b890), so the PHP binary ships
+# prebuilt; see `p2s.py build --from-source` (README) for compiling it instead —
+# measured: a from-source rebuild keeps both symbol offsets and R0/CMDOFF.
+# bin/libphp.so is libs/libphp.so of a php-src 8.4.4 build (src/php-src-844.tar)
+# configured as documented in the README.
 
 ARG BASE=ubuntu:24.04
 ARG APT=cn
