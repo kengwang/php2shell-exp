@@ -2,10 +2,13 @@
 """One-click driver for the php2shell lab.
 
   python p2s.py build          # build the docker image (prebuilt libphp.so)
+  python p2s.py build --from-source [--src DIR|TAR]
+                              # compile mod_php from php-src 8.4.4 first
   python p2s.py up [profile..] # (re)create the target containers (default: all)
   python p2s.py down [profile..]
   python p2s.py status         # container/port table + liveness
   python p2s.py verify [prof]  # served headers, expose_php, libphp offsets, workers
+  python p2s.py offsets [con]  # zif_system/zval_ptr_dtor of the running binary
   python p2s.py exploit <profile> [-c CMD]  # run the matching PoC
   python p2s.py prune [profile..]  # recycle: delete session files + proof files
   python p2s.py all            # build + up + status
@@ -24,7 +27,14 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMAGE = "p2s-php844:latest"
+BUILDER_IMAGE = "p2s-builder:latest"
+SRC_CONTAINER = "p2s-srcbuild"
 GEN = os.path.join(HERE, "env", "generated")
+OFFSETS = os.path.join(GEN, "offsets.env")
+DOCKERDIR = os.path.join(HERE, "docker")
+BINDIR = os.path.join(DOCKERDIR, "bin")
+STAGEDIR = os.path.join(DOCKERDIR, "staged")
+SRCTAR = os.path.join(DOCKERDIR, "src", "php-src-844.tar")
 
 
 def profiles():
@@ -58,15 +68,134 @@ def is_running(con):
                   capture=True, echo=False).stdout.strip() == "true"
 
 
-def build(_args):
-    ctx = os.path.join(HERE, "docker")
+def _opt(args, flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+def build(args):
     apt = os.environ.get("APT", "cn")
     base = os.environ.get("BASE", "ubuntu:24.04")
     mirror = os.environ.get("APT_MIRROR", "mirrors.ustc.edu.cn")
+    prebuilt = os.path.join(BINDIR, "libphp.so")
+    if "--from-source" in args:
+        if not build_from_source(args):
+            return 1
+    elif not os.path.exists(prebuilt):
+        print("%s is missing (a fresh clone does not carry the 53 MB binary).\n"
+              "Build it from php-src instead:\n"
+              "  python p2s.py build --from-source --src <php-src checkout, branch PHP-8.4.4>\n"
+              "  (or drop a php-src-844.tar into docker/src/)" % prebuilt)
+        return 1
     run(["docker", "build", "-t", IMAGE,
          "--build-arg", "APT=" + apt,
          "--build-arg", "APT_MIRROR=" + mirror,
-         "--build-arg", "BASE=" + base, ctx])
+         "--build-arg", "BASE=" + base, DOCKERDIR])
+
+
+def source_tar(args):
+    """Resolve --src / PHP_SRC to a tar of the php-src 8.4.4 tree."""
+    src = _opt(args, "--src") or os.environ.get("PHP_SRC") or SRCTAR
+    if os.path.isdir(src):
+        os.makedirs(os.path.dirname(SRCTAR), exist_ok=True)
+        print("+ git -C %s archive --format=tar -o %s HEAD" % (src, SRCTAR))
+        run(["git", "-C", src, "archive", "--format=tar", "-o", SRCTAR, "HEAD"])
+        src = SRCTAR
+    if not os.path.isfile(src):
+        print("no php-src source at %r:\n"
+              "  --src <dir>   a checkout of branch PHP-8.4.4 (archived on the fly), or\n"
+              "  --src <tar>   / docker/src/php-src-844.tar, a `git archive` of that branch"
+              % src)
+        return None
+    return src
+
+
+def build_from_source(args):
+    """Compile libphp.so in a builder container, then stage it under docker/bin.
+
+    A rebuild is not the calibrated binary: the symbol offsets are read back
+    automatically, but the heap constants (R0_OFF, CMDOFF, the fill counts) have
+    to be re-measured, so the calibrated docker/bin/libphp.so is never silently
+    replaced (P2S_INSTALL=1 or --install opts into that).
+    """
+    src = source_tar(args)
+    if not src:
+        return False
+    apt = os.environ.get("APT", "cn")
+    mirror = os.environ.get("APT_MIRROR", "mirrors.ustc.edu.cn")
+    base = os.environ.get("BASE", "ubuntu:24.04")
+    run(["docker", "build", "-t", BUILDER_IMAGE,
+         "--build-arg", "APT=" + apt,
+         "--build-arg", "APT_MIRROR=" + mirror,
+         "--build-arg", "BASE=" + base,
+         "-f", os.path.join(DOCKERDIR, "Dockerfile.builder"), DOCKERDIR])
+    docker(["rm", "-f", SRC_CONTAINER], check=False, capture=True)
+    docker(["run", "-d", "--name", SRC_CONTAINER,
+            "-v", "%s:/src.tar:ro" % src.replace("\\", "/"),
+            "-e", "JOBS=" + os.environ.get("JOBS", "2"),
+            BUILDER_IMAGE], capture=True)
+    run(["docker", "logs", "-f", SRC_CONTAINER], check=False)
+    rc = docker(["inspect", "-f", "{{.State.ExitCode}}", SRC_CONTAINER],
+                capture=True).stdout.strip()
+    if rc != "0":
+        print("php build failed (exit %s); see the log above, and "
+              "docker logs %s" % (rc, SRC_CONTAINER))
+        return False
+    os.makedirs(STAGEDIR, exist_ok=True)
+    os.makedirs(BINDIR, exist_ok=True)
+    for f in ("libphp.so", "opcache.so", "symbols.txt"):
+        docker(["cp", "%s:/out/%s" % (SRC_CONTAINER, f),
+                os.path.join(STAGEDIR, f)], check=False, capture=True)
+    docker(["rm", "-f", SRC_CONTAINER], check=False, capture=True)
+    print("built into %s" % STAGEDIR)
+    tgt = os.path.join(BINDIR, "libphp.so")
+    install = ("--install" in args or os.environ.get("P2S_INSTALL") == "1"
+               or not os.path.exists(tgt))
+    if install:
+        if os.path.exists(tgt):
+            shutil.copyfile(tgt, tgt + ".calibrated")
+        for f in ("libphp.so", "opcache.so"):
+            if os.path.isfile(os.path.join(STAGEDIR, f)):
+                shutil.copyfile(os.path.join(STAGEDIR, f), os.path.join(BINDIR, f))
+        print("installed into docker/bin (previous copy kept as libphp.so.calibrated)"
+              if os.path.exists(tgt + ".calibrated") else
+              "installed into docker/bin")
+    else:
+        print("kept the calibrated docker/bin/libphp.so; to use the new build:\n"
+              "  cp docker/staged/libphp.so docker/bin/libphp.so\n"
+              "or re-run with --install / P2S_INSTALL=1")
+    sym = os.path.join(STAGEDIR, "symbols.txt")
+    if os.path.isfile(sym):
+        print(open(sym).read().strip())
+    print("next: python p2s.py offsets && python p2s.py verify "
+          "&& python p2s.py exploit off")
+    return True
+
+
+def offsets_env():
+    """ZIF_OFF/DTOR_OFF for the rebuilt binary, if docker/offsets.py ran."""
+    vals = {}
+    try:
+        with open(OFFSETS) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    vals[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return vals
+
+
+def offsets(args):
+    """Report the running target's libphp symbol offsets (nm inside the container)."""
+    con = args[0] if args else "p2s-def"
+    name = con[4:] if con.startswith("p2s-") else con
+    pf = profiles()
+    if name not in pf or not ensure(name):
+        print("container %s is not serving; try `p2s.py up %s` first" % (con, name))
+        return 1
+    return run([sys.executable, os.path.join(DOCKERDIR, "offsets.py"), con, OFFSETS],
+               check=False).returncode
 
 
 def gen_if_missing():
@@ -320,6 +449,9 @@ def exploit(args):
     env["PYTHONUNBUFFERED"] = "1"
     # how many prefork children the multi-worker PoC has to fan out over
     env["MWN"] = str(pf[name][5])
+    # a rebuilt libphp.so: docker/offsets.py read the symbol offsets out of it
+    for k, v in offsets_env().items():
+        env.setdefault(k, v)
     for k, v in PROFILE_ENV.get(name, {}).items():
         env.setdefault(k, v)
     r = run([sys.executable, os.path.join(HERE, script)] + extra, env=env,
@@ -332,7 +464,8 @@ def exploit(args):
 
 
 CMDS = {"build": build, "up": up, "down": down, "status": status,
-        "verify": verify, "exploit": exploit, "prune": prune}
+        "verify": verify, "offsets": offsets, "exploit": exploit,
+        "prune": prune}
 
 
 def main():

@@ -30,3 +30,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --- build products of `build --from-source` ------------------------------
+# the freshly compiled mod_php, before it is promoted into docker/bin
+docker/staged/
+# the calibrated binary kept as a backup when a rebuild is installed
+docker/bin/*.calibrated
+# proof/offsets scratch left by the vendored reference chain run standalone
+exploits/out/

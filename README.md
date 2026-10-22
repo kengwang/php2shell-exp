@@ -19,8 +19,10 @@ the image so the calibration and the binary always agree.
 
 ```bash
 python p2s.py build            # docker build (apt from the USTC mirror by default)
+                               # add --from-source to compile mod_php first
 python p2s.py up               # create + start all 14 target containers
 python p2s.py verify           # served page, expose_php, libphp offsets, worker count
+python p2s.py offsets          # zif_system / zval_ptr_dtor of the running target
 python p2s.py exploit off      # run the PoC against one profile -> PROOF: uid=33(www-data)
 python p2s.py prune            # recycle lab state: session files + proof files
 python p2s.py down             # remove the containers
@@ -46,6 +48,9 @@ Useful knobs (env):
 p2s.py                  one-click driver (build/up/down/status/verify/exploit/prune)
 docker/
   Dockerfile            ubuntu:24.04 + apache2 runtime libs + prebuilt libphp.so
+  Dockerfile.builder    optional: build deps for `build --from-source`
+  build-libphp.sh       the php-src 8.4.4 compile script that runs in it
+  offsets.py            nm reader: writes env/generated/offsets.env for the PoCs
   bin/libphp.so         the PHP 8.4.4-dev build the offsets were calibrated on
   bin/opcache.so        only used by the `opc` profile
   src/php-src-844.tar   matching PHP source, for rebuilding (136 MB, not needed to run)
@@ -213,9 +218,43 @@ chunk and `libphp` bases and one leak is enough.
 
 ## Rebuilding the victim binary
 
-The image ships `docker/bin/libphp.so`; `docker/src/php-src-844.tar` is the
-matching source.  If you rebuild it, use exactly this configure command (it is
-what the calibrated binary was built with — `strings docker/bin/libphp.so | grep
+Prefer the shipped `docker/bin/libphp.so`: every constant below was measured on
+that exact file (md5 `f402b493b1df82cbf34021b4aef133cb`).  A fresh clone does not
+carry it (53 MB), so compile it yourself instead:
+
+```bash
+python p2s.py build --from-source                      # uses docker/src/php-src-844.tar
+python p2s.py build --from-source --src E:/Clones/php-src   # git-archives that checkout first
+```
+
+`--from-source` builds `docker/Dockerfile.builder` (ubuntu + the `-dev` packages
+the calibrated binary links against), bind-mounts the source tar into a
+`p2s-srcbuild` container and runs `docker/build-libphp.sh`, then copies the result
+to `docker/staged/`:
+
+* `docker/bin/libphp.so` is absent → the new build is installed there (a backup is
+  kept as `libphp.so.calibrated` when one is present).
+* otherwise the calibrated binary stays; swap manually or use `--install` /
+  `P2S_INSTALL=1`.
+* `docker/src/php-src-844.tar` is byte-identical to `git archive HEAD` of branch
+  `PHP-8.4.4`, so it never has to be committed.
+
+`python p2s.py offsets` then reads the *symbol* offsets out of the running
+container (`docker/offsets.py` → `env/generated/offsets.env`), and `exploit` picks
+them up automatically through `ZIF_OFF`/`DTOR_OFF`, so `zif_system` /
+`zval_ptr_dtor` need no hand-editing after a rebuild.
+
+What a rebuild does *not* give you for free is the heap layout: `R0_OFF`, `CMDOFF`
+and the fill counts are properties of the build, the `php.ini` and the victim page,
+and they are only obtainable with gdb against a live child:
+
+```bash
+python measure/dev_r0.py            # -> R0_OFF; README 'Constants' for CMDOFF/fills
+python p2s.py verify && python p2s.py exploit off   # the cheap proof the constants survived
+```
+
+If you compile by hand instead, use exactly this configure command (it is what the
+calibrated binary was built with — `strings docker/bin/libphp.so | grep
 './configure'` reproduces it, and `php -i` inside a container shows the same):
 
 ```
@@ -226,11 +265,11 @@ what the calibrated binary was built with — `strings docker/bin/libphp.so | gr
 ```
 
 `--with-config-file-path=/usr/local/etc/php` is why `ensure`/`create` mounts the
-profile directory there as well as at `/srv/profile`.  Any rebuild shifts the
-heap layout: re-measure `R0`/`CMDOFF`/fill counts with `measure/` before trusting
-the offsets, and note that `nm` on the new binary must still give
-`zif_system=0x457fe0` / `zval_ptr_dtor=0x64b890` (`p2s.py verify` checks exactly
-that).
+profile directory there as well as at `/srv/profile`.  `--with-readline` links GNU
+readline (`libedit-dev` would produce a different binary), and installing an extra
+`-dev` package (libzip, libicu, …) silently enables an extension and moves the heap
+layout — the builder image deliberately installs only what
+`objdump -p docker/bin/libphp.so | grep NEEDED` asks for.
 
 ## Gotchas that cost time
 
@@ -241,9 +280,9 @@ that).
   stops landing on `R0`.
 * With `apache2 -f <conf>`, `PHPIniDir` is ignored by this build; the ini has to
   sit at the compiled-in path, hence the double mount at `/usr/local/etc/php`.
-* The image ships the prebuilt `libphp.so` rather than building from
-  `docker/src/php-src-844.tar`: the offsets are only valid for a byte-identical
-  binary.
+* The image ships the prebuilt `libphp.so` because the calibrated offsets are only
+  valid for a byte-identical binary; `build --from-source` is the fallback for a
+  clone that has no 53 MB blob (see "Rebuilding the victim binary").
 * Never attach gdb with breakpoints during a stage-A request: `SIGKILL`ing gdb
   leaves `int3` bytes in `libphp.so` (including inside the inlined
   `php_session_send_cookie`), which corrupts every later run.  Read-only batch
