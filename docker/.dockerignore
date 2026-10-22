@@ -1,0 +1,4 @@
+# the image only needs bin/ + www/ + entrypoint.sh; keep the 136 MB tarball out of
+# the build context unless it is explicitly copied in
+src/
+__pycache__/

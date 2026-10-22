@@ -1,0 +1,32 @@
+# --- generated, regenerable at runtime -------------------------------------
+# env/gen_profiles.py writes these; `python p2s.py up` regenerates them
+# (the opc dir also gets a staged copy of docker/bin/opcache.so)
+env/generated/
+
+# per-run lab artifacts: the victim writes its proof through /srv/out,
+# p2s.py prune clears them. Never commit a proof file.
+out-*/
+
+# --- large rebuild input ---------------------------------------------------
+# php-src-844.tar (136 MB) — the image ships the prebuilt libphp.so instead,
+# and the calibrated offsets are only valid for that byte-identical binary.
+# Un-ignore it locally if you want to rebuild libphp.so (see README).
+docker/src/
+
+# --- logs / scratch --------------------------------------------------------
+*.log
+sweep.log
+*.pid
+nohup.out
+
+# --- python / editor / OS cruft -------------------------------------------
+__pycache__/
+*.py[cod]
+*.orig
+*.rej
+*~
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
