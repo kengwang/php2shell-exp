@@ -344,6 +344,12 @@ Kept: the four PoC scripts plus the vendored reference `exploit.py`, the gdb-dri
 measurement scripts that document *how* each constant was obtained, and the four
 `gdb-*.py` scripts those drivers load.
 
+This delivery is the mod_php chain only.  The nginx + PHP-FPM line — a second chain
+that goes through a completely different SAPI path, probed with the custom fpm image
+`Dockerfile`, `php-fpm.conf`, `fcgi.py`, `bg_fpm.py` and the `gdb-bg*.py` set under
+`fpm/` — is still being developed internally; those scripts are not in this
+repository and are not planned for release.
+
 ## Acknowledgements
 
 * [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp)

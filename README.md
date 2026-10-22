@@ -313,6 +313,10 @@ python p2s.py verify && python p2s.py exploit off   # 最省事的存活证明
 保留:四个 PoC 加原样保留的参考实现 `exploit.py`、记录了每个常量*如何*测得的 gdb
 驱动脚本,以及这些驱动加载的四个 `gdb-*.py`。
 
+本交付只做 mod_php 这一条链。php-fpm/nginx(SAPI 路径完全不同的另一条链,探测脚本
+为 `fpm/` 下的自制 fpm 镜像 `Dockerfile`、`php-fpm.conf`、`fcgi.py`、`bg_fpm.py` 与
+整套 `gdb-bg*.py` 探针)仍在内部推进,这些脚本不在本仓库,也不计划公开。
+
 ## 致谢
 
 * [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp)
