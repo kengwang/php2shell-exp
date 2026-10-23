@@ -256,7 +256,7 @@ chunk 偏移(`R0`)处分配 session 的 `zend_reference`,随后请求死掉,留�
      type_info 字段(`data` 在结构 +0x50,块基址 `0x63000`,容器里 `gdb -ex 'ptype /o'`
      核对过),把进度数组变成标量。
    * R2b:打到 `chunk+0x63050` —— 同一个 zval 的 value,让它指回一个 8 槽伪数组。
-   * R3:用负 `used_slots` 打到 `chunk+0x58250`(= `E_OFF+16 + 8*LAST_DELTA`,落盘
+   * R3:用负 `used_slots` 打到 `chunk+0x58190`(= `E_OFF+16 + 8*LAST_DELTA`,落盘
      写入器那一段),同一请求的伪 dtor 块里再放好计数 `19` 和
      `"/srv/www/shell.php"` 字节 —— 解码器把它们当成写入目标。
 4. **落盘即写入。** 同一个请求结束时 `php_session_rfc1867_update()` →
@@ -287,8 +287,8 @@ shaping 请求(1、2)把 worker 打死是设计的一部分:nginx 返回 502/500
 | --- | --- | --- |
 | `E_OFF` | `chunk + 0x76000` | 陈旧 `var_entries` 块(= 填充第 118 页 `ENTPAGE`) |
 | `DT_OFF` | `chunk + 0xDC000` | 陈旧 `var_dtor_entries` 块(= 填充第 220 页 `DTPAGE`) |
-| push 目标 | `0x63058` 标量化、`0x63050` 伪数组、`0x58250` 落盘写入器 | `E_OFF + 16 + 8*used_slots` |
-| `LAST_DELTA` | `-0x3BD0` | 负 `used_slots`,让 push 回打到 `0x58250` |
+| push 目标 | `0x63058` 标量化、`0x63050` 伪数组、`0x58190` 落盘写入器 | `E_OFF + 16 + 8*used_slots` |
+| `LAST_DELTA` | `-0x3BD0` | 负 `used_slots`,让 push 回打到 `0x58190` |
 | progress 块 | `chunk + 0x63000` | `php_session_rfc1867_progress`,结构体 144 字节 |
 | 填充字段 | `FILLER=540672` B,起于第 `FSTART=100` 页 | 伪块按绝对 chunk 偏移打补丁 |
 | session 记录 | `SMALL=73` 条 + 1 条 `FNLEN=1000000` B 文件名 | prime 前奏 `build_A()` |
