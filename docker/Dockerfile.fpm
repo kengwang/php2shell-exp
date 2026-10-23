@@ -1,0 +1,49 @@
+# php2shell lab target for the second chain: nginx + PHP-FPM (sapi/fpm).
+#
+#   python p2s.py fpm-build     # compile /opt/phpfpm from php-src into docker/staged/phpfpm
+#   python p2s.py fpm-up        # build this image and start p2s-fpm on 127.0.0.1:8112
+#   python p2s.py exploit fpm   # pure-HTTP chain -> PROOF: uid=33(www-data)
+#
+# The php-fpm binary is NOT shipped (53 MB blobs stay out of the repo): it is
+# produced by docker/build-phpfpm.sh from the same php-src 8.4.4 archive as
+# mod_php, with the calibrated flags (--disable-all --enable-fpm --enable-session,
+# CFLAGS='-g -O0 -fPIC').  It links only libc/libm.
+#
+# One container runs both nginx (front-end, port 80) and php-fpm (127.0.0.1:9000,
+# pm = static, 1 child) so the request path is a real HTTP -> nginx -> FPM chain.
+
+ARG BASE=ubuntu:24.04
+ARG APT=cn
+ARG APT_MIRROR=mirrors.ustc.edu.cn
+FROM ${BASE}
+
+ARG APT
+ARG APT_MIRROR
+
+RUN set -eux; \
+    if [ "$APT" = "cn" ]; then \
+        codename=$(. /etc/os-release; echo "$VERSION_CODENAME"); \
+        printf 'Types: deb\nURIs: http://%s/ubuntu/\nSuites: %s %s-updates %s-backports\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\nTypes: deb\nURIs: http://%s/ubuntu/\nSuites: %s-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+            "$APT_MIRROR" "$codename" "$codename" "$codename" \
+            "$APT_MIRROR" "$codename" > /etc/apt/sources.list.d/ubuntu.sources; \
+        rm -f /etc/apt/sources.list; \
+    elif [ "$APT" = "skip" ]; then \
+        echo "apt=skip: relying on packages already present in ${BASE}"; \
+        exit 0; \
+    fi; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        nginx iproute2 procps psmisc gdb binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY staged/phpfpm /opt/phpfpm
+COPY fpm/nginx.conf /srv/fpm/nginx.conf
+COPY fpm/php-fpm.conf /srv/fpm/php-fpm.conf
+COPY fpm/php.ini /srv/fpm/php.ini
+COPY entrypoint-fpm.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+ && mkdir -p /srv/www /srv/out /var/lib/php/sessions \
+ && chown -R www-data:www-data /var/lib/php/sessions \
+ && /opt/phpfpm/sbin/php-fpm -v
+
+EXPOSE 80
+ENTRYPOINT ["/entrypoint.sh"]

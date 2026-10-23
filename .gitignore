@@ -31,10 +31,14 @@ __pycache__/
 Thumbs.db
 desktop.ini
 
-# --- build products of `build --from-source` ------------------------------
-# the freshly compiled mod_php, before it is promoted into docker/bin
+# --- build products of `build --from-source` / `fpm-build` ----------------
+# the freshly compiled mod_php (and, for the FPM chain, /opt/phpfpm), before they
+# are promoted into docker/bin / copied into the image
 docker/staged/
 # the calibrated binary kept as a backup when a rebuild is installed
 docker/bin/*.calibrated
 # proof/offsets scratch left by the vendored reference chain run standalone
 exploits/out/
+# the webshell the FPM chain writes into the (host-mounted) document root;
+# `p2s.py prune fpm` removes it, it must never be committed
+docker/fpm/www/shell.php

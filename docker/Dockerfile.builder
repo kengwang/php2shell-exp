@@ -42,5 +42,6 @@ RUN set -eux; \
     && rm -rf /var/lib/apt/lists/*
 
 COPY build-libphp.sh /build-libphp.sh
-RUN chmod +x /build-libphp.sh
+COPY build-phpfpm.sh /build-phpfpm.sh
+RUN chmod +x /build-libphp.sh /build-phpfpm.sh
 CMD ["/build-libphp.sh"]
