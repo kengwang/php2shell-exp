@@ -11,6 +11,10 @@
 #
 # One container runs both nginx (front-end, port 80) and php-fpm (127.0.0.1:9000,
 # pm = static, 1 child) so the request path is a real HTTP -> nginx -> FPM chain.
+#
+# The fpm/ configs baked below are defaults only: p2s.py bind-mounts the profile
+# directory (docker/fpm = memory_limit 8M, docker/fpm128 = the stock 128M) over
+# /srv/fpm, so one image serves both FPM targets.
 
 ARG BASE=ubuntu:24.04
 ARG APT=cn

@@ -2,12 +2,12 @@
 
 English | [中文](README.md)
 
-One vulnerability, two chains, two SAPIs, two calibrations:
+One vulnerability, two chains, two SAPIs, three heap calibrations:
 
 | chain | victim shape | how code executes | PoC |
 | --- | --- | --- | --- |
 | mod_php | Apache 2.4.58 prefork + `libphp.so`, page is a bare `echo` | dangling `zend_reference` → fake `HashTable` with `pDestructor = zif_system`, the last request calls `system()` | `exploits/def_rce.py` and 3 more |
-| nginx + PHP-FPM | nginx 1.24 + `php-fpm` compiled here (`pm = static`, 1 child), page calls `session_start()` | the dangling `BG(unserialize)` decoder rewrites where the session gets written, so the FPM worker **itself** writes a session file full of PHP code into the document root → arbitrary file write → request it | `exploits/fpm_rce.py` |
+| nginx + PHP-FPM | nginx 1.24 + `php-fpm` compiled here (`pm = static`, 1 child), page calls `session_start()`; two profiles, `memory_limit` 8M and PHP's stock 128M | the dangling `BG(unserialize)` decoder rewrites where the session gets written, so the FPM worker **itself** writes a session file full of PHP code into the document root → arbitrary file write → request it | `exploits/fpm_rce.py`, `exploits/fpm128_rce.py` |
 
 Neither chain needs an exploit class or a helper endpoint, neither changes the
 victim's PHP code, neither needs a rebuild or gdb on the target, ASLR is fully
@@ -25,7 +25,11 @@ in a `Set-Cookie` header, and the final request turns a dangling
 
 **The FPM chain** needs no code pointer and therefore no `libphp` leak; in
 exchange the victim page really has to call `session_start()` and the document
-root has to be writable.
+root has to be writable.  `memory_limit` is no longer a condition: both 8M and
+PHP's stock 128M work — the latter swaps the pressure source for RFC1867 parts
+with an empty `filename`, ~300 request bytes per ~128 KB of heap, so one request
+fills a 128 MB limit and every request still fits nginx's default
+`client_max_body_size 1m`.
 
 Verified targets: our own `PHP 8.4.4-dev` build (Ubuntu 24.04; mod_php via the
 prebuilt `libphp.so` md5 `f402b493b1df82cbf34021b4aef133cb`, shipped in the image
@@ -52,19 +56,20 @@ python p2s.py prune            # recycle lab state: session files + proof files
 python p2s.py down             # remove the containers
 
 python p2s.py fpm-build        # second chain: compile sapi/fpm from the same php-src
-python p2s.py fpm-up           # nginx + php-fpm container on 127.0.0.1:8112
+python p2s.py fpm-up           # two nginx + php-fpm containers (8112 = 8M, 8113 = 128M)
 python p2s.py verify fpm       # page content, fpm version, writable docroot, memory_limit
-python p2s.py exploit fpm      # run the FPM chain -> PROOF: uid=33(www-data)
-python p2s.py prune fpm        # delete session files + the shell the chain wrote
-python p2s.py fpm-down
+python p2s.py exploit fpm      # FPM chain, memory_limit=8M  -> PROOF: uid=33(www-data)
+python p2s.py exploit fpm128   # same chain against PHP's stock 128M -> PROOF: uid=33(www-data)
+python p2s.py prune fpm fpm128 # delete session files + the shell the chain wrote
+python p2s.py fpm-down         # optional profile names; without them both go away
 ```
 
 `build` once, then `exploit <profile>` alone is enough: it re-creates a missing
 container by itself (`ensure`), cleans stale session/proof files before and after
 the run, prints the PoC output and exits non-zero when no proof was produced.
-A 128M mod_php run takes ~8 s end to end, the FPM chain ~11.6 s (measured
-2026-10-23).  `exploit`/`verify`/`prune` all accept the name `fpm`, and `-c '…'`
-works there too.
+A 128M mod_php run takes ~8 s end to end, the FPM chain ~11.6 s and the FPM 128M
+chain ~33.8 s (measured 2026-10-23).  `exploit`/`verify`/`prune` all accept the
+names `fpm` and `fpm128`, and `-c '…'` works there too.
 
 Useful knobs (env):
 
@@ -74,8 +79,9 @@ Useful knobs (env):
 | `APT_MIRROR` | `mirrors.ustc.edu.cn` | mirror used when `APT=cn` |
 | `BASE` | `ubuntu:24.04` | base image |
 | `P2S_CLEAN` | `1` | set `0` to keep session/proof files after a run |
-| `FPM_PORT` | `8112` | host port of the nginx + PHP-FPM target |
-| `CMD` via `exploit <p> -c '…'` | `id>/srv/out/pd` (`id` for `fpm`) | command to run; for mod_php the proof path follows the `>/srv/out/<file>` redirect, for `fpm` the output is saved to `out-fpm/pfpm` |
+| `FPM_PORT` | `8112` | host port of the 8M nginx + PHP-FPM target |
+| `FPM128_PORT` | `8113` | host port of the 128M nginx + PHP-FPM target |
+| `CMD` via `exploit <p> -c '…'` | `id>/srv/out/pd` (`id` for both fpm profiles) | command to run; for mod_php the proof path follows the `>/srv/out/<file>` redirect, for `fpm`/`fpm128` the output is saved to `out-fpm/pfpm` / `out-fpm128/pfpm128` |
 
 ## What the lab is
 
@@ -84,7 +90,7 @@ p2s.py                  one-click driver (build/up/down/status/verify/offsets/ex
                         + fpm-build/fpm-up/fpm-down)
 docker/
   Dockerfile            ubuntu:24.04 + apache2 runtime libs + prebuilt libphp.so (mod_php)
-  Dockerfile.fpm        ubuntu:24.04 + nginx + /opt/phpfpm (FPM chain)
+  Dockerfile.fpm        ubuntu:24.04 + nginx + /opt/phpfpm (one image, both FPM profiles)
   Dockerfile.builder    optional: build deps for `build --from-source` / `fpm-build`
   build-libphp.sh       the php-src 8.4.4 mod_php compile script that runs in it
   build-phpfpm.sh       the php-src 8.4.4 sapi/fpm compile script that runs in it
@@ -98,6 +104,9 @@ docker/
   fpm/php.ini           `memory_limit = 8M`, upload_progress On, writable save_path
   fpm/www/index.php     the FPM victim page: `<?php session_start(); echo "OK\n"; ?>`
   fpm/www/plain.php     bare `echo` page, used for shaping requests and liveness
+  fpm128/               the same chain's 128M target: differs from fpm/ only in
+                        php.ini's memory_limit and nginx.conf (no raised body limit);
+                        its www/ holds byte-identical copies of the two pages
   entrypoint.sh         mkdir /srv/out, then `apache2 -f /srv/profile/apache.conf`
   entrypoint-fpm.sh     start php-fpm, then `exec nginx -g 'daemon off;'`
 env/gen_profiles.py     single source of truth for the 14 profiles -> env/generated/<name>/
@@ -110,6 +119,8 @@ exploits/               the PoCs (self-contained, no absolute host paths)
   dev_off_rce.py        display_errors=On + expose_php=Off with a long command
                         (also what the opcache profile uses, via CMDOFF)
   fpm_rce.py            nginx + PHP-FPM chain (dangling BG(unserialize) → file write)
+  fpm128_rce.py         the same chain against PHP's stock memory_limit=128M
+                        (empty-filename RFC1867 parts as the pressure source)
 measure/                calibration & gdb helpers (not needed for a plain run)
   exploit drivers       measure_dd_any.py, mw_full_test.py, measure_s3_formfill.py,
                         measure_loaded_worker.py, dev_r0.py (re-measure R0)
@@ -123,12 +134,15 @@ Per profile, `env/generated/<name>/` holds `php.ini`, `apache.conf`, `port`.
 reads the ini) — plus `docker/www` at `/srv/www` and `out-<name>/` at `/srv/out`.
 One container per profile, all published on `127.0.0.1` only.
 
-The FPM chain has one container, `p2s-fpm`: nginx (:80 → host `FPM_PORT`, 8112 by
-default) and php-fpm (container `127.0.0.1:9000`) in the same image, configured
-straight from `docker/fpm/`, with `docker/fpm/www` mounted at `/srv/www`
-**writable** (the chain writes there) and `out-fpm/` at `/srv/out`.  It is not
-part of the 14 profiles: `fpm-up`/`fpm-down` manage it, and `status` adds a row
-for it while it is alive.
+The FPM chain has two containers, `p2s-fpm` and `p2s-fpm128`, from one image: the
+profile directory (`docker/fpm` or `docker/fpm128`) is bind-mounted read-only over
+`/srv/fpm`, shadowing the copy baked into the image, so 8M vs 128M is literally one
+`php.ini` and one `client_max_body_size` line apart.  Each container runs nginx
+(:80 → host `FPM_PORT`/`FPM128_PORT`, 8112/8113 by default) and php-fpm (container
+`127.0.0.1:9000`), with `docker/<profile>/www` mounted at `/srv/www` **writable**
+(the chain writes there) and `out-<profile>/` at `/srv/out`.  They are not part of
+the 14 mod_php profiles: `fpm-up`/`fpm-down` manage them (optionally with profile
+names), and `status` adds a row for each one while it is alive.
 
 ## Profiles and which PoC fits
 
@@ -149,15 +163,18 @@ for it while it is alive.
 | `mw` | p2s-mw | 8100 | 128M | Off | Off | /tmp | 8 | – | `measure/mw_full_test.py` (fan-out) |
 | `opc` | p2s-opc | 8111 | 128M | On | Off | /tmp | 1 | On | `exploits/dev_off_rce.py` + `CMDOFF=0x7a118` |
 | `fpm` | p2s-fpm | 8112 | 8M | Off | On | /var/lib/php/sessions | 1 (static) | – | `exploits/fpm_rce.py` |
+| `fpm128` | p2s-fpm128 | 8113 | 128M | Off | On | /var/lib/php/sessions | 1 (static) | – | `exploits/fpm128_rce.py` |
 
-The first 14 rows are mod_php profiles; the last one is the nginx + PHP-FPM
-chain (`sapi=fpm`), managed by `fpm-build`/`fpm-up` on its own.
+The first 14 rows are mod_php profiles; the last two are the nginx + PHP-FPM chain
+(`sapi=fpm`), the same chain at two `memory_limit`s, managed by
+`fpm-build`/`fpm-up` on its own.
 
 The mod_php profiles all serve the same 22-byte victim page.  `exploit <alias>`
 picks the PoC, the heap calibration (`PROFILE`) and the proof path for you;
 `-s <script>` overrides the script, `-c` the command, a trailing number sets the
 fan-out width for `mw` (default: the profile's `MaxRequestWorkers`).
-`exploit fpm` takes `-c` as well and saves its proof to `out-fpm/pfpm`.
+`exploit fpm`/`fpm128` take `-c` as well and save their proofs to
+`out-fpm/pfpm` / `out-fpm128/pfpm128`.
 
 Verified in this tree on 2026-10-23: `p2s.py verify` is green for all 14 mod_php
 containers, and one back-to-back sweep of `exploit` produced
@@ -167,7 +184,9 @@ containers, and one back-to-back sweep of `exploit` produced
 For the FPM chain, `php-fpm` is compiled by `fpm-build` (it links only libc/libm)
 and `exploit fpm` produced `uid=33(www-data)` on three independent runs — fresh,
 immediately re-run, and after `docker restart p2s-fpm` (a whole new ASLR set) —
-each in ~11.6 s.
+each in ~11.6 s.  `exploit fpm128` worked on the first run against the `fpm-build`
+binary and reproduced after `fpm-down fpm128` + `fpm-up` (fresh container, new ASLR),
+each in ~33.8 s.
 
 ## What we added over the reference chain
 
@@ -190,7 +209,8 @@ baseline; the table below is what this tree changes, with the profile that prove
 | "a different PHP build or version means re-calibrating the offsets", with the tooling outside the delivery | the re-measurement is part of the lab: `p2s.py offsets` reads `zif_system`/`zval_ptr_dtor` out of the running target into `env/generated/offsets.env` and `exploit` injects them as `ZIF_OFF`/`DTOR_OFF`; `R0_OFF`, `CMDOFF`, `NFILL/FILLSZ/S3_BIGLEN`, `BURN_SPEC/TAIL*` are all env-overridable; `measure/dev_r0.py` + `measure/gdb/` show how each constant is obtained | Rebuilding the victim binary, below |
 | the target binary is whatever the official image ships | `build --from-source` compiles mod_php from php-src, so a clone that does not carry the 53 MB blob is self-sufficient | see the experiment below |
 | delivery is `run_pure.sh` + one `exploit.py` | 14 profiles × one command, `verify`/`status`/`offsets`/`prune`, proof-script pairing, container self-healing after an external `docker prune`, bilingual README | Quick start, Recycling |
-| one SAPI only (mod_php) | a second chain through PHP-FPM, which is a completely different SAPI path: the pre-RINIT dangling `BG(unserialize)` decoder rewrites the session write target, so no code pointer and no `libphp` leak are needed at all | `fpm`, The chain (2) below |
+| one SAPI only (mod_php) | a second chain through PHP-FPM, which is a completely different SAPI path: the pre-RINIT dangling `BG(unserialize)` decoder rewrites the session write target, so no code pointer and no `libphp` leak are needed at all | `fpm`, `fpm128`, The chain (2) below |
+| the FPM chain needs a small `memory_limit` to be fillable at all | the pressure source becomes `filename=""` RFC1867 parts: ~300 request bytes per ~128 KB of heap, 920 parts are enough to OOM a worker under PHP's stock 128 MB limit; and every request also fits nginx's default `client_max_body_size 1m`, so the front end needs no tuning | `fpm128`, the 128M variant below |
 
 ## The chain (1) — mod_php
 
@@ -251,7 +271,9 @@ mod_php is ordering — `php_request_startup()` calls `sapi_activate()`
 something mod_php never does: a dangling decoder that survives across requests.
 
 `exploits/fpm_rce.py` sends five kinds of requests and walks the decoder towards
-the session writer in three decode steps:
+the session writer in three decode steps (`exploits/fpm128_rce.py` is the same
+sequence with a different heap calibration — see "the 128M variant" at the end of
+this section):
 
 1. **R1 — turn the payload into a session key.**  An upload request carrying
    `PHP_SESSION_UPLOAD_PROGRESS=<?php system($_GET[0]); ?>` makes PHP store that
@@ -296,9 +318,40 @@ the session writer in three decode steps:
    consumes the `<?php … ?>` tag and runs it, and the command output comes back
    between the payload key and the next record.
 
-The 502/500 on the shaping requests (steps 1-2) is by design: the OOM kills the
-worker and FPM forks a replacement, while the process-global `BG(unserialize)` and
-the chunk layout stay put.  The whole chain takes ~11.6 s.
+Killing the worker on the shaping requests (steps 1-2) is by design: FPM forks a
+replacement while the process-global `BG(unserialize)` and the chunk layout stay
+put.  On the 8M target the whole chain takes ~11.6 s.
+
+### The 128M variant (`exploits/fpm128_rce.py`)
+
+Same primitive, same request sequence, heap calibration swapped for PHP's stock
+`memory_limit=128M`:
+
+* **Pressure source**: the deep-nested plain fields become RFC1867 parts with an
+  empty filename — `"x<k>[a][a]…"` (depth 60), empty value, `filename=""`.  About
+  300 request bytes cost about 128 KB of heap, so `PRESS=920` parts alone are enough
+  to OOM a 128 MB worker.
+* **The forge field** shrinks from `FILLER=540672` (132 pages) to `131072` (32 pages,
+  starting at page `FSTART=100`): it still covers `E_OFF=0x76000` (page 118), while
+  the stale dtor block moves from `0xDC000` (page 220) to `DT_OFF=0x7C000` (page 124).
+  The three push targets (`0x63058`/`0x63050`/`0x58190`) are unchanged — they come out
+  of struct layout, not out of the limit.
+* **A session**: 73 small records plus 20 records with a `FNLEN=750000` filename
+  (the 8M build uses one 1 MB filename), landing 15,029,535 bytes on disk.
+* **prime request**: `FIELDS=170` 4000-byte fields + `PRIME_PRESS=780` pressure parts
+  + the `DUP` re-sent names.  780 is deliberately below 920: the parse has to survive
+  to reach `session_start()`, so it is the decode — not the body parser — that hits
+  the limit.
+* **No front-end tuning**: measured bodies are R1 272,529 · A-small 272,501 ·
+  A-big 1,022,503 · prime 925,016 · R2b 403,567 · R3 131,357 bytes, all inside nginx's
+  default `client_max_body_size 1m` (1,048,576) — A-big has only ~26 KB of headroom,
+  which is why `FNLEN` is an environment variable rather than a constant.
+* **Status codes differ per target**: the 8M shaping requests answer 502/500, the 128M
+  ones answer 200 (the child had already flushed the response headers before the OOM,
+  so nginx can only finish the reply normally).  Same OOM either way; `wait_target()`
+  polls `/plain.php` until it is back before the next step.
+* ~33.8 s end to end, most of it waiting for the worker to come back after each of the
+  93 A records.
 
 ## Constants
 
@@ -312,7 +365,7 @@ the chunk layout stay put.  The whole chain takes ~11.6 s.
 | `CMDOFF` | `0x83118` Off, `0x84118` On, `0x7a118` under opcache |
 | chunk size | `0x200000` (`ZEND_MM_CHUNK_SIZE`) |
 
-### Constants (FPM chain)
+### Constants (FPM chain, 8M)
 
 | item | value | note |
 | --- | --- | --- |
@@ -321,11 +374,27 @@ the chunk layout stay put.  The whole chain takes ~11.6 s.
 | push targets | `0x63058` scalarize, `0x63050` fake array, `0x58190` session writer | `E_OFF + 16 + 8*used_slots` |
 | `LAST_DELTA` | `-0x3BD0` | negative `used_slots`, aims the push backwards at `0x58190` |
 | progress block | `chunk + 0x63000` | `php_session_rfc1867_progress`, 144 bytes |
+| R3 fake string | `len(FPM_SHELL)+1` = `19`, value at `DT_OFF+0x38` | the length counts the trailing NUL: `ps_files_path_create()` memcpy's exactly `ZSTR_LEN(basedir)` bytes and `open()` stops at that NUL |
 | filler field | `FILLER=540672` B starting at page `FSTART=100` | the fake blocks are patched at absolute chunk offsets |
 | session records | `SMALL=73` + one `FNLEN=1000000` B filename | the `build_A()` prelude of prime |
 | nested walls | `NESTED=890` / prime `PRIME_NESTED=300`, `LEVELS=60` | OOM before the END cleanup |
 | prime request | `FILL_FIELDS=700` × `FILL_LEN=4000` + `DUP` repeated names | hits the 8M limit |
-| ini | `memory_limit=8M`, `post_max_size=8M`, upload_progress On + cleanup On | `docker/fpm/php.ini` |
+| ini | `memory_limit=8M`, `post_max_size=8M`, upload_progress On + cleanup On | `docker/fpm/php.ini`, nginx `client_max_body_size 8m` |
+
+### Constants (FPM chain, 128M)
+
+| item | value | note |
+| --- | --- | --- |
+| `E_OFF` | `chunk + 0x76000` | measured the same as on the 8M target; filler starts at page 100 |
+| `DT_OFF` | `chunk + 0x7C000` | the stale `var_dtor_entries` block moves to page 124 (the filler is only 32 pages) |
+| push targets | `0x63058` / `0x63050` / `0x58190` | identical to the 8M target, `aim(off) = (off - (E_OFF+16)) // 8` |
+| filler field | `FILLER=131072` B (32 pages) starting at page `FSTART=100` | covers both `E_OFF` and `DT_OFF` |
+| pressure parts | `PRESS=920` RFC1867 parts, `filename=""`, depth `LEVELS=60` | ~300 B per part buys ~128 KB of heap; enough to OOM the worker |
+| prime pressure | `PRIME_PRESS=780` (< `PRESS`) | the parse must survive to reach `session_start()`, so the decode hits the limit |
+| prime request | `FIELDS=170` × `FIELD_LEN=4000` + `DUP` repeated names | plugs the rest of the chunk |
+| session records | `SMALL=73` small + `BIG=20` with `FNLEN=750000` B filenames | `build_A()`, 15,029,535 B on disk |
+| request bodies | largest 1,022,503 B (A-big) | all under nginx's default `client_max_body_size 1m` |
+| ini | `memory_limit=128M` (PHP's default), `post_max_size=8M`, upload_progress On + cleanup On | `docker/fpm128/php.ini`, nginx.conf leaves the body limit alone |
 
 Everything the PoC needs from the target is a leaked `chunk` and `libphp` base per
 run, so ASLR and container restarts are irrelevant.  What is *not* portable is the
@@ -339,10 +408,13 @@ layout.  `def_rce.py` accepts `BURN_SPEC/TAILB/TAILC/TAILD/DUPNAMES/CMDOFF/R0_OF
 NFILL/FILLSZ/S3_BIGLEN` from the environment so a re-measurement does not need an
 edit.
 
-Every FPM constant is env-overridable under its own name too
-(`E_OFF`/`SCALAR_PUSH`/`ARRAY_PUSH`/`LAST_DELTA`/`FILLER`/`FSTART`/`ENTPAGE`/
+Every FPM constant is env-overridable under its own name too — on the 8M PoC
+`E_OFF`/`SCALAR_PUSH`/`ARRAY_PUSH`/`LAST_DELTA`/`FILLER`/`FSTART`/`ENTPAGE`/
 `DTPAGE`/`NESTED`/`PRIME_NESTED`/`LEVELS`/`SMALL`/`FNLEN`/`FILL_FIELDS`/`FILL_LEN`/
-`DUP`).  And the FPM chain needs **no leak at all**: the fake blocks, the progress
+`DUP`, on the 128M PoC `E_OFF`/`DT_OFF`/`SCALAR_PUSH`/`ARRAY_PUSH`/`WRITER`/`FILLER`/
+`FSTART`/`PRESS`/`PRIME_PRESS`/`FIELDS`/`FIELD_LEN`/`LEVELS`/`SMALL`/`BIG`/`FNLEN`/`DUP`
+— so a new build or ini only needs a re-measurement.  And the FPM chain needs **no
+leak at all**: the fake blocks, the progress
 struct and the writer are all addressed chunk-relatively, and the layout inside a
 chunk is byte-identical after `fork()`, so a container restart with a fresh ASLR
 set changes nothing (verified).
@@ -374,14 +446,16 @@ chunk and `libphp` bases and one leak is enough.
 anything that parses the body inside `sapi_activate()`), a page that actually
 calls `session_start()` (or any other entry into `php_session_start()`),
 `session.upload_progress.enabled=On` and `.cleanup=On`, the `files` save handler,
-**a document root writable by `www-data`**, and a `memory_limit` small enough for
-one request to exhaust it (8M here).  This chain asks nothing of
+**a document root writable by `www-data`**.  This chain asks nothing of
 `display_errors` or `expose_php`, uses no code pointer and needs no base leak.
+Not hard any more: `memory_limit` (both 8M and PHP's stock 128M work) and the front
+end's body limit (the 128M variant keeps every request inside nginx's default 1m).
 Real-world blockers: the write target has to be web-reachable and writable; with
 `pm.max_children` above 1 the prime and the decode requests must land on the same
 worker (this tree pins `pm = static` with one child); `session.upload_progress.freq`/
-`min_freq`, nginx `client_max_body_size` and similar tuning change how many shaping
-requests the chain needs and how they look.
+`min_freq` and the front end's `client_max_body_size` (the 8M variant needs it raised
+to 8m, the 128M variant does not) change how many shaping requests the chain needs and
+how they look.
 
 ## Recycling
 
@@ -397,12 +471,14 @@ requests the chain needs and how they look.
 * A stage-3 B is *expected* to kill the child: Apache's parent forks a fresh one,
   and the leaked bases stay valid because they are inherited across `fork()`.  If
   the parent itself dies, the leak is stale — `p2s.py up <profile>` before retrying.
-* FPM chain: `p2s.py prune fpm` clears `/var/lib/php/sessions/sess_*` plus the
-  `docker/fpm/www/shell.php` the chain wrote (the document root is a host mount, so
-  the webshell survives the container — `exploit fpm` deletes it before and after).
-  `fpm-down` removes the container, `docker rmi p2s-php844-fpm` the image.  Killing
-  the worker during prime is expected here too; FPM replaces it immediately and both
-  the stale globals and the chunk layout survive.
+* FPM chain: `p2s.py prune fpm fpm128` clears each container's
+  `/var/lib/php/sessions/sess_*` plus the `docker/<profile>/www/shell.php` the chain
+  wrote (the document root is a host mount, so the webshell survives the container —
+  `exploit fpm*` deletes it before and after), and the matching `out-fpm/` /
+  `out-fpm128/` proof directories.
+  `fpm-down [profile…]` removes the containers, `docker rmi p2s-php844-fpm` the image.
+  Killing the worker during prime is expected here too; FPM replaces it immediately and
+  both the stale globals and the chunk layout survive.
 
 ## Rebuilding the victim binary
 
@@ -490,7 +566,8 @@ command is part of the calibration:
 ```
 
 `--disable-all` fixes the extension set and `-O0` fixes the allocation sequence of
-request startup — the FPM constants above were measured on exactly that
+request startup — the "Constants (FPM chain, 8M)" and "Constants (FPM chain, 128M)"
+tables were measured on exactly that
 combination, so changing either moves the block addresses inside the chunk.  The
 result is `make install`ed to `/opt/phpfpm`, archived as
 `docker/staged/phpfpm.tar`, unpacked to `docker/staged/phpfpm/` and `COPY`ed
@@ -501,7 +578,10 @@ Measured on 2026-10-23, this tree: the resulting `php-fpm` (md5
 `4b6b73a350e09fcc791c0f20a95ca7d0`, links only libc/libm) completed the whole FPM
 chain **on the first try**, with the block offsets matching the calibration — same
 conclusion as for mod_php: same source, same configure command, same package
-versions ⇒ the calibration survives the rebuild.
+versions ⇒ the calibration survives the rebuild.  The 128M block addresses were
+originally measured on a differently compiled `php-fpm` (same configure command,
+different md5), and they worked first run on this `fpm-build` output too: the block
+positions follow the configure command and the ini, not the build directory.
 
 ## Gotchas that cost time
 
@@ -525,13 +605,21 @@ versions ⇒ the calibration survives the rebuild.
   Docker Desktop starts killing containers.
 * Both FPM pages are part of the calibration: `docker/fpm/www/index.php` must really
   call `session_start()` (39 bytes) and `plain.php` is the bare `echo` page
-  (22 bytes) used only for shaping requests and the liveness poll.
-* 502/500 from the FPM shaping requests is **expected** (the OOM kills the worker and
-  FPM forks a replacement); the PoC polls `/plain.php` until it answers 200 again
-  before continuing.  Do not read those status codes as a failure.
-* The FPM chain needs a writable document root, so `docker/fpm/www` is mounted
-  read-write and the `shell.php` it produces lands back on the host — `prune fpm`
-  (and the before/after cleanup inside `exploit fpm`) is what removes it.
+  (22 bytes) used only for shaping requests and the liveness poll.  `docker/fpm128/www/`
+  holds byte-identical copies.
+* Killing the worker on the FPM shaping requests is **expected**, but the status code
+  follows how much the child had already flushed: 502/500 on the 8M target, 200 on the
+  128M one.  The PoC polls `/plain.php` until it answers 200 again before continuing,
+  and success is the written shell echoing something — not a status code.
+* On the 128M target `PRIME_PRESS=780` has to stay below `PRESS=920`: the point of prime
+  is that `session_start()`'s decode hits the limit, not the body parser.  Too many
+  parts and the request dies during parsing, `BG(unserialize)` never dangles and every
+  later decode step does nothing.
+* The 128M A-big request is 1,022,503 bytes, ~26 KB below nginx's default 1m
+  (1,048,576) — keep `FNLEN` env-overridable, raising it silently starts returning 413.
+* The FPM chain needs a writable document root, so `docker/<profile>/www` is mounted
+  read-write and the `shell.php` it produces lands back on the host — `prune fpm fpm128`
+  (and the before/after cleanup inside `exploit fpm*`) is what removes it.
 * In Git Bash `SHELL` already has a meaning, so it is a bad variable name for a PoC —
   the FPM write target is `FPM_SHELL`.
 
@@ -548,13 +636,13 @@ chain was first measured with (the direct-to-9000 `fcgi.py`, `bg_fpm.py` and the
 `gdb-bg*.py` set — their conclusions are baked into `exploits/fpm_rce.py` as
 constants, and its containerised HTTP environment was rewritten as
 `docker/Dockerfile.fpm` + `docker/fpm/`), and every `out-*` run artifact.
-Kept: the five PoC scripts (four mod_php + the nginx/PHP-FPM one) plus the vendored
-reference `exploit.py`, the gdb-driven measurement scripts that document *how* each
-constant was obtained, and the four `gdb-*.py` scripts those drivers load.
+Kept: the six PoC scripts (four mod_php + the two nginx/PHP-FPM calibrations) plus the
+vendored reference `exploit.py`, the gdb-driven measurement scripts that document *how*
+each constant was obtained, and the four `gdb-*.py` scripts those drivers load.
 
 Both chains ship in this repository and both are one command away: mod_php under
 "The chain (1)" (`exploit off` and friends), nginx + PHP-FPM under "The chain (2)"
-(`exploit fpm`).
+(`exploit fpm` / `exploit fpm128`).
 
 ## Acknowledgements
 
@@ -573,7 +661,8 @@ Both chains ship in this repository and both are one command away: mod_php under
   chain comes from it: PHP-FPM's pre-RINIT session decode leaves a dangling
   `BG(unserialize)` decoder.  Turning that into a pure-HTTP, one-command
   nginx + PHP-FPM exploit — the three-step push calibration, the choice of write
-  target, the container and rebuild flow — is this tree's work.
+  target, scaling the pressure with empty-filename parts so PHP's stock 128M limit is
+  fillable, the container and rebuild flow — is this tree's work.
 * The PHP bug itself (the session UAF behind the bailout) is upstream's; this lab
   is research into its exploitability, run against our own containers.
 

@@ -40,5 +40,5 @@ docker/bin/*.calibrated
 # proof/offsets scratch left by the vendored reference chain run standalone
 exploits/out/
 # the webshell the FPM chain writes into the (host-mounted) document root;
-# `p2s.py prune fpm` removes it, it must never be committed
-docker/fpm/www/shell.php
+# `p2s.py prune fpm fpm128` removes it, it must never be committed
+docker/fpm*/www/shell.php

@@ -1,6 +1,8 @@
 #!/bin/sh
 # nginx front-end + PHP-FPM in one container.
-#   /srv/fpm/{nginx.conf,php-fpm.conf,php.ini}  baked into the image
+#   /srv/fpm/{nginx.conf,php-fpm.conf,php.ini}  read-only mount of the profile
+#              directory (docker/fpm or docker/fpm128), which shadows the copy
+#              baked into the image
 #   /srv/www   the two victim pages (bind-mounted, writable: the chain writes
 #              its shell here, so the artifact is visible on the host)
 #   /srv/out   proof files from the mod_php PoCs (unused by this target)
